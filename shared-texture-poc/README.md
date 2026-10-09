@@ -1,9 +1,10 @@
 # sharedTexture POC
 
 A Python process renders with OpenGL and Electron shows the result without
-copying it through the CPU. Tested on Linux with NVIDIA and Electron 44. There
-are two producers, and `main.js` picks one based on the platform Electron runs
-on (`--ozone-platform`, otherwise Wayland if `WAYLAND_DISPLAY` is set):
+copying it through the CPU. Tested on Linux with NVIDIA, on macOS 26 with an
+Apple M3 Max, and Electron 44. There are three producers, and `main.js` picks one
+based on the platform Electron runs on (macOS; on Linux `--ozone-platform`,
+otherwise Wayland if `WAYLAND_DISPLAY` is set):
 
 - **Wayland**, `wayland_producer.py`: renders on a headless EGL context and
   exports the texture as a DMA-BUF. Electron imports it with `sharedTexture` and
@@ -11,6 +12,9 @@ on (`--ozone-platform`, otherwise Wayland if `WAYLAND_DISPLAY` is set):
 - **X11**, `x11_producer.py`: `sharedTexture` doesn't work on X11 (see
   Findings), so this one renders with GLX into a child X window placed over the
   page's content area.
+- **macOS** (Apple Silicon only), `macos_producer.py`: renders on a windowless
+  CGL context into a global IOSurface. Electron opens it by ID, imports it with
+  `sharedTexture` and draws it into a canvas.
 
 ## Setup
 
@@ -26,9 +30,10 @@ uv venv .venv && uv pip install -p .venv -r requirements.txt
 npm start
 ```
 
-The content area should pulse red at about 60 fps. To check that real pixels
-arrive, look at the once-a-second log line: on Wayland the main process logs
-`[renderer] ... center rgba=...`; on X11 the producer logs its own fps.
+The content area should pulse red at about 60 fps (about 50 fps on macOS, see
+Findings). To check that real pixels arrive, look at the once-a-second log line:
+on Wayland and macOS the main process logs `[renderer] ... center rgba=...`; on
+X11 the producer logs its own fps.
 
 Overrides:
 
@@ -92,6 +97,30 @@ Limitations: HTML can't be drawn over the render area, and the geometry is set
 once at startup (the window isn't resizable). A resizable version would need
 `main.js` to send geometry updates and the producer to call `XMoveResizeWindow`.
 
+## How it works: macOS
+
+1. `macos_producer.py` creates a GL 4.1 core context with CGL (no window; on
+   Apple Silicon this is Apple's GL-on-Metal driver), and a BGRA IOSurface with
+   `kIOSurfaceIsGlobal` set. It binds the IOSurface to a `GL_TEXTURE_RECTANGLE`
+   with `CGLTexImageIOSurface2D` (CGL only binds IOSurfaces to rectangle
+   textures) and attaches that to an FBO.
+2. The producer sends a `texture` message with `ioSurfaceId` (`IOSurfaceGetID`)
+   instead of `fourcc`/`modifier`/`planes`.
+3. `main.js` opens the surface in its own process with `IOSurfaceLookup(id)`
+   (`iosurface.js`, through koffi) and keeps that reference for the session.
+4. For each `frame` message, `main.js` calls `sharedTexture.importSharedTexture`
+   with handle `{ ioSurface }`: a Buffer holding the `IOSurfaceRef` pointer.
+   The rest (`sendSharedTexture`, `frame_done`, `preload.js`) is shared with
+   Wayland.
+
+IOSurfaces have no implicit fences, so the producer `glFinish`es before each
+`frame` message, and the `frame_done` backpressure keeps it from drawing into
+the surface while Electron reads it.
+
+Unlike X11, HTML draws over the render area (the stats overlay is visible), and
+`ioclasscount IOSurface` stays flat while the app runs, so no surface leaks per
+frame.
+
 ## Findings
 
 - **`sharedTexture` does not work on X11**, and the producer can't fix it. NVIDIA's EGL on X11
@@ -122,3 +151,14 @@ once at startup (the window isn't resizable). A resizable version would need
 - **fd ownership.** Electron `dup()`s the plane fds on every import, so
   `main.js` keeps one copy for the whole session, imports from it each frame,
   and closes it on shutdown.
+- **macOS works with a global IOSurface.** Electron's `ioSurface` handle is a
+  pointer that is only valid in the main process, so the surface must be
+  opened there. `IOSurfaceLookup(id)` still works on macOS 26 for surfaces
+  created with `kIOSurfaceIsGlobal`, but that flag is deprecated and blocked
+  under the App Sandbox. A shipped app would send a Mach port from
+  `IOSurfaceCreateMachPort` instead, which needs a native helper since neither
+  Node nor Python can send Mach ports.
+- **macOS runs at about 50 fps, not 60.** Not investigated yet. The likely
+  cause is the single surface: each frame waits for the `frame_done` round
+  trip before the next render starts. Rendering into two IOSurfaces in turn
+  would remove that wait.

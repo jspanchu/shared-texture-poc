@@ -3,52 +3,68 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
-const { dupFdFromProcess, closeFd } = require('./pidfd');
+
+// Loaded on demand: pidfd.js needs Linux's libc, iosurface.js needs macOS frameworks.
+const pidfd = () => require('./pidfd');
+const iosurface = () => require('./iosurface');
 
 let producer = null;
 let server = null;
 let socket = null;
 let localFds = [];
+let surfaceRef = null;
 
 const pythonPath = () => {
   const venv = path.join(__dirname, '.venv', 'bin', 'python');
   return fs.existsSync(venv) ? venv : (process.env.PYTHON || 'python3');
 };
 
-// Electron uses Wayland when it's available, unless --ozone-platform says otherwise.
-const usesX11 = () => {
-  const platform = app.commandLine.getSwitchValue('ozone-platform');
-  return platform ? platform === 'x11' : !process.env.WAYLAND_DISPLAY;
+// On Linux, Electron uses Wayland when it's available, unless --ozone-platform says otherwise.
+const platform = () => {
+  if (process.platform === 'darwin') return 'mac';
+  const ozone = app.commandLine.getSwitchValue('ozone-platform');
+  return (ozone ? ozone === 'x11' : !process.env.WAYLAND_DISPLAY) ? 'x11' : 'wayland';
 };
 
 const send = (msg) => {
   if (socket && !socket.destroyed) socket.write(JSON.stringify(msg) + '\n');
 };
 
-// Duplicate the producer's dma-buf fds into this process and describe the texture.
-const importTextureInfo = (msg) => {
+// Duplicate the producer's dma-buf fds into this process.
+const nativePixmapHandle = (msg) => {
   console.log(`[main] texture ${msg.width}x${msg.height} ${msg.fourcc} (${msg.pixelFormat}) modifier=${msg.modifier}`);
-  localFds = msg.planes.map((p) => dupFdFromProcess(msg.pid, p.fd));
+  localFds = msg.planes.map((p) => pidfd().dupFdFromProcess(msg.pid, p.fd));
   console.log(`[main] producer fds ${msg.planes.map((p) => p.fd)} -> local fds ${localFds}`);
   return {
-    pixelFormat: msg.pixelFormat,
-    codedSize: { width: msg.width, height: msg.height },
-    visibleRect: { x: 0, y: 0, width: msg.width, height: msg.height },
-    handle: {
-      nativePixmap: {
-        planes: msg.planes.map((p, i) => ({ fd: localFds[i], stride: p.stride, offset: p.offset, size: p.size })),
-        modifier: msg.modifier,
-        supportsZeroCopyWebGpuImport: false,
-      },
+    nativePixmap: {
+      planes: msg.planes.map((p, i) => ({ fd: localFds[i], stride: p.stride, offset: p.offset, size: p.size })),
+      modifier: msg.modifier,
+      supportsZeroCopyWebGpuImport: false,
     },
   };
 };
+
+// Open the producer's global IOSurface in this process.
+const ioSurfaceHandle = (msg) => {
+  const { lookupSurface, describeSurface, surfaceHandle } = iosurface();
+  surfaceRef = lookupSurface(msg.ioSurfaceId);
+  console.log(`[main] texture ${msg.width}x${msg.height} (${msg.pixelFormat}) IOSurface id=${msg.ioSurfaceId} ${describeSurface(surfaceRef)}`);
+  return { ioSurface: surfaceHandle(surfaceRef) };
+};
+
+// Describe the producer's texture for sharedTexture.importSharedTexture.
+const importTextureInfo = (msg) => ({
+  pixelFormat: msg.pixelFormat,
+  codedSize: { width: msg.width, height: msg.height },
+  visibleRect: { x: 0, y: 0, width: msg.width, height: msg.height },
+  handle: msg.ioSurfaceId !== undefined ? ioSurfaceHandle(msg) : nativePixmapHandle(msg),
+});
 
 const forwardFrame = async (win, textureInfo, msg) => {
   const frameDone = () => send({ type: 'frame_done', seq: msg.seq });
   let imported = null;
   try {
-    // Electron dup()s the plane fds, so localFds can be re-imported every frame.
+    // Electron dup()s the plane fds / retains the IOSurface, so they can be re-imported every frame.
     imported = sharedTexture.importSharedTexture({
       textureInfo: { ...textureInfo, timestamp: msg.timestamp_us },
       allReferencesReleased: frameDone,
@@ -76,7 +92,7 @@ const handleConnection = (win, conn) => {
         try {
           textureInfo = importTextureInfo(msg);
         } catch (err) {
-          console.error('[main] failed to get producer fds:', err);
+          console.error('[main] failed to get producer texture:', err);
           conn.destroy();
         }
       } else if (msg.type === 'frame' && textureInfo) {
@@ -98,7 +114,9 @@ const startProducer = (win) => {
     win.webContents.send('size', { width, height, cssWidth: cw, cssHeight: ch });
 
     let args;
-    if (usesX11()) {
+    if (platform() === 'mac') {
+      args = [path.join(__dirname, 'macos_producer.py'), String(port), String(width), String(height)];
+    } else if (platform() === 'x11') {
       // The X window includes the menu bar, so place the child over the content area only.
       const xid = win.getNativeWindowHandle().readUInt32LE();
       const bounds = win.getBounds();
@@ -123,8 +141,10 @@ const cleanup = () => {
   socket = null;
   server?.close();
   server = null;
-  localFds.forEach(closeFd);
+  localFds.forEach((fd) => pidfd().closeFd(fd));
   localFds = [];
+  if (surfaceRef) iosurface().releaseSurface(surfaceRef);
+  surfaceRef = null;
 };
 
 const createWindow = () => {
