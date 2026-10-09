@@ -1,0 +1,22 @@
+{
+  "name": "shared-texture-poc",
+  "version": "1.0.0",
+  "description": "Electron sharedTexture POC: DMA-BUF from a Python/EGL producer",
+  "license": "ISC",
+  "author": "jaswant",
+  "type": "commonjs",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "koffi": "^2.9.0"
+  },
+  "devDependencies": {
+    "electron": "44.7.0"
+  },
+  "allowScripts": {
+    "electron@44.7.0": true,
+    "koffi@2.16.3": true
+  }
+}
