@@ -2,9 +2,10 @@
 
 A Python process renders with OpenGL and Electron shows the result without
 copying it through the CPU. Tested on Linux with NVIDIA, on macOS 26 with an
-Apple M3 Max, and Electron 44. There are three producers, and `main.js` picks one
-based on the platform Electron runs on (macOS; on Linux `--ozone-platform`,
-otherwise Wayland if `WAYLAND_DISPLAY` is set):
+Apple M3 Max, on Windows 11 with an NVIDIA RTX 4060, and Electron 44. There are
+four producers, and `main.js` picks one based on the platform Electron runs on
+(Windows; macOS; on Linux `--ozone-platform`, otherwise Wayland if
+`WAYLAND_DISPLAY` is set):
 
 - **Wayland**, `wayland_producer.py`: renders on a headless EGL context and
   exports the texture as a DMA-BUF. Electron imports it with `sharedTexture` and
@@ -14,6 +15,10 @@ otherwise Wayland if `WAYLAND_DISPLAY` is set):
   page's content area.
 - **macOS** (Apple Silicon only), `macos_producer.py`: renders on a windowless
   CGL context into a global IOSurface. Electron opens it by ID, imports it with
+  `sharedTexture` and draws it into a canvas.
+- **Windows** (NVIDIA, or any driver with `WGL_NV_DX_interop2`),
+  `windows_producer.py`: renders with WGL into a D3D11 texture and shares it
+  through an NT handle. Electron duplicates the handle, imports it with
   `sharedTexture` and draws it into a canvas.
 
 ## Setup
@@ -32,7 +37,7 @@ npm start
 
 The content area should pulse red at about 60 fps (about 50 fps on macOS, see
 Findings). To check that real pixels arrive, look at the once-a-second log line:
-on Wayland and macOS the main process logs `[renderer] ... center rgba=...`; on
+on Wayland, macOS and Windows the main process logs `[renderer] ... center rgba=...`; on
 X11 the producer logs its own fps.
 
 Overrides:
@@ -40,6 +45,8 @@ Overrides:
 - `RENDER_NODE=/dev/dri/renderD12x` (Wayland only): the GPU the producer
   renders on. By default it uses the GPU driving the display (see "Same GPU"
   below). On X11, GLX always renders on the GPU driving the X screen.
+- `D3D_ADAPTER=<n>` (Windows only): the DXGI adapter index the producer
+  allocates on. The default, 0, is the adapter Chromium uses too.
 - `PYTHON=/path/to/python`: the interpreter for the producer. It is only used
   when `.venv/` doesn't exist.
 
@@ -121,6 +128,31 @@ Unlike X11, HTML draws over the render area (the stats overlay is visible), and
 `ioclasscount IOSurface` stays flat while the app runs, so no surface leaks per
 frame.
 
+## How it works: Windows
+
+1. `windows_producer.py` creates a legacy WGL context on a hidden window, and a
+   D3D11 device on DXGI adapter 0 (`D3D_ADAPTER`). Both must be on the same
+   GPU, or `wglDXOpenDeviceNV` fails.
+2. It creates two BGRA D3D11 textures: a private one that GL renders into
+   through `WGL_NV_DX_interop2` (attached to an FBO), and a shared one with
+   `D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE`, with an
+   NT handle from `IDXGIResource1::CreateSharedHandle`. The COM calls go
+   through ctypes with vtable indices taken from the Windows SDK headers.
+3. The producer sends a `texture` message with its pid and `ntHandle`, the
+   handle's value in *its own* handle table.
+4. `main.js` copies the handle into its own process with `OpenProcess` +
+   `DuplicateHandle` (`winhandle.js`, through koffi), keeps it for the session
+   and passes it as handle `{ ntHandle }`: a Buffer holding the HANDLE value.
+   The rest (`sendSharedTexture`, `frame_done`, `preload.js`) is shared with
+   Wayland and macOS.
+5. Each frame: lock the interop object, `glClear`, unlock, `CopyResource` into
+   the shared texture, then wait on a D3D11 event query before sending `frame`.
+   Electron's `bgra` textures have no keyed mutex, so this wait plus the
+   `frame_done` backpressure is all the synchronization there is.
+
+As on macOS, HTML draws over the render area, and the handle counts of the
+Electron and Python processes stay flat while the app runs.
+
 ## Findings
 
 - **`sharedTexture` does not work on X11**, and the producer can't fix it. NVIDIA's EGL on X11
@@ -162,3 +194,18 @@ frame.
   cause is the single surface: each frame waits for the `frame_done` round
   trip before the next render starts. Rendering into two IOSurfaces in turn
   would remove that wait.
+- **Windows works, with one GPU copy per frame.** NVIDIA's
+  `wglDXRegisterObjectNV` fails with `ERROR_OPEN_FAILED` (`0xC007006E`) on a
+  texture created with `SHARED_NTHANDLE`. It works on plain and legacy-shared
+  (`MISC_SHARED` only) textures. Electron only accepts NT handles, so GL
+  renders into a private texture that is copied into the shared one with
+  `CopyResource`. This costs one GPU copy, which a
+  `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` texture created and rendered by D3D
+  itself (or by ANGLE, or Vulkan with external memory) wouldn't need. Electron
+  duplicates the NT handle on every import, so as with dma-buf fds `main.js`
+  keeps one copy for the session.
+- **Windows: same GPU.** As on Linux, the shared texture must be on the GPU
+  Chromium uses (adapter 0 unless Windows' per-app GPU preference says
+  otherwise), and the WGL context must be on that GPU too. On hybrid laptops
+  where `python.exe` and `electron.exe` get different GPUs, set the per-app
+  preference in Windows Settings > Display > Graphics, or `D3D_ADAPTER`.

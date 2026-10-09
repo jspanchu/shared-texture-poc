@@ -4,24 +4,30 @@ const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
 
-// Loaded on demand: pidfd.js needs Linux's libc, iosurface.js needs macOS frameworks.
+// Loaded on demand: pidfd.js needs Linux's libc, iosurface.js needs macOS frameworks,
+// winhandle.js needs kernel32.
 const pidfd = () => require('./pidfd');
 const iosurface = () => require('./iosurface');
+const winhandle = () => require('./winhandle');
 
 let producer = null;
 let server = null;
 let socket = null;
 let localFds = [];
 let surfaceRef = null;
+let localHandle = null;
 
 const pythonPath = () => {
-  const venv = path.join(__dirname, '.venv', 'bin', 'python');
-  return fs.existsSync(venv) ? venv : (process.env.PYTHON || 'python3');
+  const venv = process.platform === 'win32'
+    ? path.join(__dirname, '.venv', 'Scripts', 'python.exe')
+    : path.join(__dirname, '.venv', 'bin', 'python');
+  return fs.existsSync(venv) ? venv : (process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3'));
 };
 
 // On Linux, Electron uses Wayland when it's available, unless --ozone-platform says otherwise.
 const platform = () => {
   if (process.platform === 'darwin') return 'mac';
+  if (process.platform === 'win32') return 'win';
   const ozone = app.commandLine.getSwitchValue('ozone-platform');
   return (ozone ? ozone === 'x11' : !process.env.WAYLAND_DISPLAY) ? 'x11' : 'wayland';
 };
@@ -52,19 +58,33 @@ const ioSurfaceHandle = (msg) => {
   return { ioSurface: surfaceHandle(surfaceRef) };
 };
 
+// Duplicate the producer's D3D11 shared texture handle into this process.
+const ntHandle = (msg) => {
+  const { dupHandleFromProcess, handleBuffer } = winhandle();
+  localHandle = dupHandleFromProcess(msg.pid, msg.ntHandle);
+  console.log(`[main] texture ${msg.width}x${msg.height} (${msg.pixelFormat}) producer handle 0x${msg.ntHandle.toString(16)} -> local handle 0x${localHandle.toString(16)}`);
+  return { ntHandle: handleBuffer(localHandle) };
+};
+
+const textureHandle = (msg) => {
+  if (msg.ioSurfaceId !== undefined) return ioSurfaceHandle(msg);
+  if (msg.ntHandle !== undefined) return ntHandle(msg);
+  return nativePixmapHandle(msg);
+};
+
 // Describe the producer's texture for sharedTexture.importSharedTexture.
 const importTextureInfo = (msg) => ({
   pixelFormat: msg.pixelFormat,
   codedSize: { width: msg.width, height: msg.height },
   visibleRect: { x: 0, y: 0, width: msg.width, height: msg.height },
-  handle: msg.ioSurfaceId !== undefined ? ioSurfaceHandle(msg) : nativePixmapHandle(msg),
+  handle: textureHandle(msg),
 });
 
 const forwardFrame = async (win, textureInfo, msg) => {
   const frameDone = () => send({ type: 'frame_done', seq: msg.seq });
   let imported = null;
   try {
-    // Electron dup()s the plane fds / retains the IOSurface, so they can be re-imported every frame.
+    // Electron dup()s the plane fds / NT handle and retains the IOSurface, so they can be re-imported every frame.
     imported = sharedTexture.importSharedTexture({
       textureInfo: { ...textureInfo, timestamp: msg.timestamp_us },
       allReferencesReleased: frameDone,
@@ -114,7 +134,9 @@ const startProducer = (win) => {
     win.webContents.send('size', { width, height, cssWidth: cw, cssHeight: ch });
 
     let args;
-    if (platform() === 'mac') {
+    if (platform() === 'win') {
+      args = [path.join(__dirname, 'windows_producer.py'), String(port), String(width), String(height)];
+    } else if (platform() === 'mac') {
       args = [path.join(__dirname, 'macos_producer.py'), String(port), String(width), String(height)];
     } else if (platform() === 'x11') {
       // The X window includes the menu bar, so place the child over the content area only.
@@ -145,6 +167,8 @@ const cleanup = () => {
   localFds = [];
   if (surfaceRef) iosurface().releaseSurface(surfaceRef);
   surfaceRef = null;
+  if (localHandle) winhandle().closeHandle(localHandle);
+  localHandle = null;
 };
 
 const createWindow = () => {
