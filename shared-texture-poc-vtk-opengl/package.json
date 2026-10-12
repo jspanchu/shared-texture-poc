@@ -1,0 +1,19 @@
+{
+  "name": "shared-texture-poc-vtk-opengl",
+  "version": "1.0.0",
+  "description": "Electron sharedTexture POC from a VTK python producer",
+  "license": "ISC",
+  "author": "jaswant",
+  "type": "commonjs",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "electron": "^44.7.0"
+  },
+  "dependencies": {
+    "koffi": "^3.3.3"
+  }
+}
