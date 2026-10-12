@@ -148,7 +148,7 @@ const startProducer = (win) => {
       args = [path.join(__dirname, 'x11_vtk_frame_producer.py'), String(port), `0x${xid.toString(16)}`,
         String(x), String(y), String(width), String(height)];
     } else {
-      args = [path.join(__dirname, 'vtk_frame_producer.py'), String(port), String(width), String(height)];
+      args = [path.join(__dirname, 'wayland_vtk_frame_producer.py'), String(port), String(width), String(height)];
     }
     console.log(`[main] spawning ${pythonPath()} ${args.join(' ')}`);
     producer = spawn(pythonPath(), args, { stdio: 'inherit' });
