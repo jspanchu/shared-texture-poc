@@ -22,6 +22,8 @@ from vtkmodules.vtkRenderingUI import vtkGenericRenderWindowInteractor
 class LineSocket:
     def __init__(self, port):
         self.sock = socket.create_connection(("127.0.0.1", port))
+        # Small request/response messages: don't let Nagle wait for delayed ACKs.
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.buf = b""
 
     def send(self, msg):

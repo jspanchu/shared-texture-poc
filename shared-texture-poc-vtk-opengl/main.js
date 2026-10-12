@@ -102,6 +102,9 @@ const forwardFrame = async (win, textureInfo, msg) => {
 
 const handleConnection = (win, conn) => {
   socket = conn;
+  // Without this, Nagle holds frame_done back behind unacknowledged input events until
+  // the producer's delayed ACK (40ms on Linux), capping interaction at ~20fps.
+  conn.setNoDelay(true);
   let textureInfo = null;
   let buf = '';
   conn.on('data', (chunk) => {
