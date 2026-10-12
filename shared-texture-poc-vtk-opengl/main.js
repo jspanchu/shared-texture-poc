@@ -135,7 +135,7 @@ const startProducer = (win) => {
 
     let args;
     if (platform() === 'win') {
-      args = [path.join(__dirname, 'vtk_frame_producer.py'), String(port), String(width), String(height)];
+      args = [path.join(__dirname, 'windows_vtk_frame_producer.py'), String(port), String(width), String(height)];
     } else if (platform() === 'mac') {
       args = [path.join(__dirname, 'macos_vtk_frame_producer.py'), String(port), String(width), String(height)];
     } else if (platform() === 'x11') {
