@@ -6,9 +6,9 @@ const path = require('node:path');
 
 // Loaded on demand: pidfd.js needs Linux's libc, iosurface.js needs macOS frameworks,
 // winhandle.js needs kernel32.
-const pidfd = () => require('./pidfd');
-const iosurface = () => require('./iosurface');
-const winhandle = () => require('./winhandle');
+const pidfd = () => require('./dma/pidfd');
+const iosurface = () => require('./dma/iosurface');
+const winhandle = () => require('./dma/winhandle');
 
 let producer = null;
 let server = null;
