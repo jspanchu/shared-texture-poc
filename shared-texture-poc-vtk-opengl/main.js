@@ -145,7 +145,7 @@ const startProducer = (win) => {
       const content = win.getContentBounds();
       const x = Math.round((content.x - bounds.x) * scaleFactor);
       const y = Math.round((content.y - bounds.y) * scaleFactor);
-      args = [path.join(__dirname, 'vtk_frame_producer.py'), String(port), `0x${xid.toString(16)}`,
+      args = [path.join(__dirname, 'x11_vtk_frame_producer.py'), String(port), `0x${xid.toString(16)}`,
         String(x), String(y), String(width), String(height)];
     } else {
       args = [path.join(__dirname, 'vtk_frame_producer.py'), String(port), String(width), String(height)];
