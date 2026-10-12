@@ -137,19 +137,29 @@ const deviceSize = (win) => {
   return { width: Math.round(cw * scaleFactor), height: Math.round(ch * scaleFactor), scaleFactor };
 };
 
+// The content area's offset in the X window, in device pixels: the X window includes the menu bar.
+const contentOffset = (win, scaleFactor) => {
+  const bounds = win.getBounds();
+  const content = win.getContentBounds();
+  return { x: Math.round((content.x - bounds.x) * scaleFactor), y: Math.round((content.y - bounds.y) * scaleFactor) };
+};
+
 // Tell the producer about new sizes, including scale factor changes, once the window settles:
-// each one reallocates the shared texture.
+// each one reallocates the shared texture. On X11 they move and resize the producer's child
+// window instead, which also has to follow the content area's offset.
 const watchSize = (win, initial) => {
   let last = initial;
   let timer = null;
   const update = () => {
     timer = null;
     if (win.isDestroyed()) return;
-    const { width, height } = deviceSize(win);
-    if (width < 1 || height < 1 || (width === last.width && height === last.height)) return;
-    last = { width, height };
-    console.log(`[main] resize ${width}x${height}`);
-    send({ type: 'resize', width, height });
+    const { width, height, scaleFactor } = deviceSize(win);
+    if (width < 1 || height < 1) return;
+    const size = platform() === 'x11' ? { width, height, ...contentOffset(win, scaleFactor) } : { width, height };
+    if (Object.keys(size).every((k) => size[k] === last[k])) return;
+    last = size;
+    console.log(`[main] resize ${JSON.stringify(size)}`);
+    send({ type: 'resize', ...size });
   };
   const schedule = () => {
     clearTimeout(timer);
@@ -169,6 +179,7 @@ const startProducer = (win) => {
   server.listen(0, '127.0.0.1', () => {
     const { port } = server.address();
     const { width, height, scaleFactor } = deviceSize(win);
+    let initial = { width, height };
 
     let args;
     if (platform() === 'win') {
@@ -176,12 +187,10 @@ const startProducer = (win) => {
     } else if (platform() === 'mac') {
       args = [path.join(__dirname, 'macos_vtk_frame_producer.py'), String(port), String(width), String(height)];
     } else if (platform() === 'x11') {
-      // The X window includes the menu bar, so place the child over the content area only.
+      // Place the child over the content area only.
       const xid = win.getNativeWindowHandle().readUInt32LE();
-      const bounds = win.getBounds();
-      const content = win.getContentBounds();
-      const x = Math.round((content.x - bounds.x) * scaleFactor);
-      const y = Math.round((content.y - bounds.y) * scaleFactor);
+      const { x, y } = contentOffset(win, scaleFactor);
+      initial = { width, height, x, y };
       args = [path.join(__dirname, 'x11_vtk_frame_producer.py'), String(port), `0x${xid.toString(16)}`,
         String(x), String(y), String(width), String(height)];
     } else {
@@ -190,7 +199,7 @@ const startProducer = (win) => {
     console.log(`[main] spawning ${pythonPath()} ${args.join(' ')}`);
     producer = spawn(pythonPath(), args, { stdio: 'inherit' });
     producer.on('exit', (code, signal) => console.log(`[main] producer exited code=${code} signal=${signal}`));
-    if (platform() !== 'x11') watchSize(win, { width, height });
+    watchSize(win, initial);
   });
 };
 
@@ -219,8 +228,6 @@ const createWindow = () => {
     width: 800,
     height: 600,
     useContentSize: true,
-    // The X11 producer's child window doesn't follow resizes yet.
-    resizable: platform() !== 'x11',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       // The preload needs require('electron').sharedTexture.

@@ -12,14 +12,15 @@ vtkXRenderWindowInteractor gets mouse and keyboard events over the render area.
 
 Chromium draws into its own child window covering the whole Electron window,
 so the producer keeps VTK's window on top of that sibling, re-raising it
-whenever Chromium restacks. The TCP connection to the Electron main process only
-ties the two lifetimes together; the producer exits when either the connection
-or the parent window goes away.
+whenever Chromium restacks. Over the TCP connection to the Electron main process
+(see producer_common.py) only {"type":"resize", ...} messages matter: they carry
+the content area's new size and offset in the parent, in device pixels, and the
+child window follows. The producer exits when either the connection or the
+parent window goes away.
 """
 
 import ctypes
 import signal
-import socket
 import sys
 import time
 
@@ -31,6 +32,8 @@ from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
 from vtkmodules.vtkFiltersSources import vtkPartitionedDataSetCollectionSource
 from vtkmodules.vtkImagingCore import vtkRTAnalyticSource
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
+
+from producer_common import LineSocket
 
 # --- Xlib ----------------------------------------------------------------------
 # VTK renders and handles input on its own display connection. This one only
@@ -137,11 +140,17 @@ def handle_x_events(dpy, window):
     return gone
 
 
-def connection_closed(sock):
-    try:
-        return sock.recv(4096) == b""
-    except BlockingIOError:
-        return False
+def handle_messages(conn, render_window, interactor):
+    """Apply the queued messages from Electron. Raises EOFError once it disconnected."""
+    while (msg := conn.recv(0)) is not None:
+        if msg["type"] != "resize":
+            continue
+        width, height = msg["width"], msg["height"]
+        print(f"[producer] resize to {msg['x']},{msg['y']} {width}x{height}", flush=True)
+        # The menu bar above the content area can change height with the scale factor.
+        render_window.SetPosition(msg["x"], msg["y"])
+        # Resizes the child window, and keeps the interactor's size in sync with it.
+        interactor.UpdateSize(width, height)
 
 
 def main():
@@ -183,9 +192,7 @@ def main():
     caps = dict(line.split(":", 1) for line in render_window.ReportCapabilities().splitlines() if ":" in line)
     print(f"[producer] GL {caps['OpenGL version string'].strip()} / {caps['OpenGL renderer string'].strip()}", flush=True)
 
-    camera = render_window.GetRenderers().GetFirstRenderer().GetActiveCamera()
-    sock = socket.create_connection(("127.0.0.1", port))
-    sock.setblocking(False)
+    conn = LineSocket(port)
     try:
         frames, window_start = 0, time.monotonic()
         frame_interval = 1 / 60
@@ -194,11 +201,8 @@ def main():
             if handle_x_events(dpy, window):
                 print("[producer] window destroyed, exiting", flush=True)
                 break
-            if connection_closed(sock):
-                print("[producer] connection closed, exiting", flush=True)
-                break
+            handle_messages(conn, render_window, interactor)
             interactor.ProcessEvents()
-            camera.Azimuth(1.0)
             render_window.Render()
             frames += 1
             if start - window_start >= 1.0:
@@ -208,10 +212,10 @@ def main():
                 remaining = frame_interval - (time.monotonic() - start)
                 if remaining > 0:
                     time.sleep(remaining)
-    except ConnectionError:
+    except (EOFError, ConnectionError):
         print("[producer] connection closed, exiting", flush=True)
     finally:
-        sock.close()
+        conn.sock.close()
         # Destroys VTK's window if it still exists; errors from a gone parent land in on_x_error.
         render_window.Finalize()
         x11.XSync(dpy, 0)
