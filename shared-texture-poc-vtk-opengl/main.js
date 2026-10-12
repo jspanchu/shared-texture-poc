@@ -17,6 +17,8 @@ let localFds = [];
 let surfaceRef = null;
 let localHandle = null;
 
+const RESIZE_DEBOUNCE_MS = 150;
+
 const pythonPath = () => {
   const venv = process.platform === 'win32'
     ? path.join(__dirname, '.venv', 'Scripts', 'python.exe')
@@ -110,6 +112,8 @@ const handleConnection = (win, conn) => {
       buf = buf.slice(nl + 1);
       if (msg.type === 'texture') {
         try {
+          // A new texture after a resize. Frames still in flight hold their own imports.
+          releaseTexture();
           textureInfo = importTextureInfo(msg);
         } catch (err) {
           console.error('[main] failed to get producer texture:', err);
@@ -123,15 +127,45 @@ const handleConnection = (win, conn) => {
   conn.on('close', () => console.log('[main] producer disconnected'));
 };
 
+// The content area in device pixels, the size the producer renders at.
+const deviceSize = (win) => {
+  const { scaleFactor } = screen.getDisplayMatching(win.getBounds());
+  const [cw, ch] = win.getContentSize();
+  return { width: Math.round(cw * scaleFactor), height: Math.round(ch * scaleFactor), scaleFactor };
+};
+
+// Tell the producer about new sizes, including scale factor changes, once the window settles:
+// each one reallocates the shared texture.
+const watchSize = (win, initial) => {
+  let last = initial;
+  let timer = null;
+  const update = () => {
+    timer = null;
+    if (win.isDestroyed()) return;
+    const { width, height } = deviceSize(win);
+    if (width < 1 || height < 1 || (width === last.width && height === last.height)) return;
+    last = { width, height };
+    console.log(`[main] resize ${width}x${height}`);
+    send({ type: 'resize', width, height });
+  };
+  const schedule = () => {
+    clearTimeout(timer);
+    timer = setTimeout(update, RESIZE_DEBOUNCE_MS);
+  };
+  win.on('resize', schedule);
+  win.on('move', schedule);
+  screen.on('display-metrics-changed', schedule);
+  win.on('closed', () => {
+    clearTimeout(timer);
+    screen.off('display-metrics-changed', schedule);
+  });
+};
+
 const startProducer = (win) => {
   server = net.createServer((conn) => handleConnection(win, conn));
   server.listen(0, '127.0.0.1', () => {
     const { port } = server.address();
-    const { scaleFactor } = screen.getDisplayMatching(win.getBounds());
-    const [cw, ch] = win.getContentSize();
-    const width = Math.round(cw * scaleFactor);
-    const height = Math.round(ch * scaleFactor);
-    win.webContents.send('size', { width, height, cssWidth: cw, cssHeight: ch });
+    const { width, height, scaleFactor } = deviceSize(win);
 
     let args;
     if (platform() === 'win') {
@@ -153,7 +187,18 @@ const startProducer = (win) => {
     console.log(`[main] spawning ${pythonPath()} ${args.join(' ')}`);
     producer = spawn(pythonPath(), args, { stdio: 'inherit' });
     producer.on('exit', (code, signal) => console.log(`[main] producer exited code=${code} signal=${signal}`));
+    if (platform() !== 'x11') watchSize(win, { width, height });
   });
+};
+
+// Close this process's references to the producer's texture.
+const releaseTexture = () => {
+  localFds.forEach((fd) => pidfd().closeFd(fd));
+  localFds = [];
+  if (surfaceRef) iosurface().releaseSurface(surfaceRef);
+  surfaceRef = null;
+  if (localHandle) winhandle().closeHandle(localHandle);
+  localHandle = null;
 };
 
 const cleanup = () => {
@@ -163,12 +208,7 @@ const cleanup = () => {
   socket = null;
   server?.close();
   server = null;
-  localFds.forEach((fd) => pidfd().closeFd(fd));
-  localFds = [];
-  if (surfaceRef) iosurface().releaseSurface(surfaceRef);
-  surfaceRef = null;
-  if (localHandle) winhandle().closeHandle(localHandle);
-  localHandle = null;
+  releaseTexture();
 };
 
 const createWindow = () => {
@@ -176,7 +216,8 @@ const createWindow = () => {
     width: 800,
     height: 600,
     useContentSize: true,
-    resizable: false,
+    // The X11 producer's child window doesn't follow resizes yet.
+    resizable: platform() !== 'x11',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       // The preload needs require('electron').sharedTexture.
@@ -185,6 +226,7 @@ const createWindow = () => {
   });
 
   ipcMain.once('receiver-ready', () => startProducer(win));
+  ipcMain.on('input', (_event, input) => send({ type: 'event', ...input }));
   ipcMain.on('stats', (_event, s) => console.log(`[renderer] frames=${s.frames} fps=${s.fps} ${s.info} center rgba=${s.center}`));
   win.loadFile("index.html");
 };

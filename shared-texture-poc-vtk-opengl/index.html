@@ -10,15 +10,16 @@
     <title>sharedTexture POC</title>
     <style>
       body { margin: 0; overflow: hidden; background: #000; }
-      canvas { display: block; }
+      canvas { display: block; width: 100vw; height: 100vh; outline: none; }
       #stats {
         position: absolute; top: 8px; left: 8px; padding: 2px 6px;
         font: 12px monospace; color: #fff; background: rgba(0, 0, 0, 0.6);
+        pointer-events: none;
       }
     </style>
   </head>
   <body>
-    <canvas id="view"></canvas>
+    <canvas id="view" tabindex="0"></canvas>
     <div id="stats">waiting for frames…</div>
   </body>
 </html>

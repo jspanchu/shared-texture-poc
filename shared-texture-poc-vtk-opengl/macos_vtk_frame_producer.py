@@ -5,30 +5,25 @@ Usage: vtk_frame_producer.py <port> <width> <height>
 The vtkOpenGLRenderWindow resolves its RenderFramebuffer into the DisplayFramebuffer
 in Frame(). We swap the DisplayFramebuffer's color attachment for an IOSurface-backed
 GL_TEXTURE_RECTANGLE, and use offscreen buffers so nothing is blitted to the window.
+The IOSurface is reallocated when the window is resized.
 
-Talks newline-delimited JSON to the Electron main process on 127.0.0.1:<port>:
-  -> {"type":"texture", ...}   once, with the IOSurface's global ID
-  -> {"type":"frame", ...}     after every render (glFinish'd)
-  <- {"type":"frame_done", ...} when Electron released the texture
+See producer_common.py for the protocol with the Electron main process and input handling;
+the "texture" message carries the IOSurface's global ID.
 """
 
 import ctypes
-import json
 import os
 import signal
-import socket
 import sys
-import time
 
 from vtkmodules.vtkCommonDataModel import vtkPiecewiseFunction
-from vtkmodules.vtkRenderingCore import vtkCompositePolyDataMapper, vtkVolume, vtkActor, vtkRenderer, vtkRenderWindow, vtkRenderWindowInteractor, vtkColorTransferFunction, vtkVolumeProperty
+from vtkmodules.vtkRenderingCore import vtkCompositePolyDataMapper, vtkVolume, vtkActor, vtkRenderer, vtkRenderWindow, vtkColorTransferFunction, vtkVolumeProperty
 from vtkmodules.vtkRenderingOpenGL2 import vtkTextureObject
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
 from vtkmodules.vtkFiltersSources import vtkPartitionedDataSetCollectionSource
 from vtkmodules.vtkImagingCore import vtkRTAnalyticSource
-from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 
-import vtkmodules.vtkRenderingUI
+from producer_common import LineSocket, serve
 
 vp = ctypes.c_void_p
 
@@ -119,11 +114,7 @@ def create_vtk_pipeline():
     # The IOSurface's alpha reaches Electron, so keep the background opaque.
     renderer.SetBackgroundAlpha(1.0)
 
-    render_window = vtkRenderWindow(
-            interactor=vtkRenderWindowInteractor(interactor_style=vtkInteractorStyleTrackballCamera()),
-            # offscreen=True,
-            # show_window=False,
-    )
+    render_window = vtkRenderWindow()
     render_window.AddRenderer(renderer)
     return render_window
 
@@ -153,7 +144,6 @@ def attach_surface(render_window, surface, width, height):
     """Make the IOSurface the color attachment 0 of the window's DisplayFramebuffer."""
     render_window.MakeCurrent()
     ctx = cgl.CGLGetCurrentContext()
-    print(f"[producer] GL {cgl.glGetString(GL_VERSION).decode()} / {cgl.glGetString(GL_RENDERER).decode()}", flush=True)
 
     # CGL only binds IOSurfaces to rectangle textures.
     handle = ctypes.c_uint32()
@@ -182,27 +172,32 @@ def attach_surface(render_window, surface, width, height):
     return tex, handle
 
 
-class LineSocket:
-    def __init__(self, port):
-        self.sock = socket.create_connection(("127.0.0.1", port))
-        self.buf = b""
+class SharedSurface:
+    """The IOSurface shared with Electron, at one size."""
 
-    def send(self, msg):
-        self.sock.sendall((json.dumps(msg) + "\n").encode())
+    def __init__(self, render_window, width, height):
+        self.render_window = render_window
+        self.width, self.height = width, height
+        self.surface = create_surface(width, height)
+        self.tex, self.handle = attach_surface(render_window, self.surface, width, height)
+        self.surface_id = iosurface.IOSurfaceGetID(self.surface)
+        print(f"[producer] IOSurface id={self.surface_id} {width}x{height} BGRA "
+              f"stride={iosurface.IOSurfaceGetBytesPerRow(self.surface)}", flush=True)
 
-    def recv(self, timeout):
-        """Return the next message, None on timeout. Raises EOFError on close."""
-        self.sock.settimeout(timeout)
-        while b"\n" not in self.buf:
-            try:
-                chunk = self.sock.recv(4096)
-            except socket.timeout:
-                return None
-            if not chunk:
-                raise EOFError
-            self.buf += chunk
-        line, self.buf = self.buf.split(b"\n", 1)
-        return json.loads(line)
+    def message(self):
+        return {
+            "type": "texture",
+            "pid": os.getpid(),
+            "width": self.width,
+            "height": self.height,
+            "pixelFormat": "bgra",
+            "ioSurfaceId": self.surface_id,
+        }
+
+    def release(self):
+        self.render_window.MakeCurrent()
+        cgl.glDeleteTextures(1, ctypes.byref(self.handle))
+        cf.CFRelease(self.surface)
 
 
 def main():
@@ -220,56 +215,35 @@ def main():
     render_window.SetFramebufferFlipY(True)
     # The first render creates the context and the framebuffers we're about to patch.
     render_window.Render()
+    render_window.MakeCurrent()
+    print(f"[producer] GL {cgl.glGetString(GL_VERSION).decode()} / {cgl.glGetString(GL_RENDERER).decode()}", flush=True)
 
-    surface = create_surface(width, height)
-    tex, handle = attach_surface(render_window, surface, width, height)
-    surface_id = iosurface.IOSurfaceGetID(surface)
-    print(f"[producer] IOSurface id={surface_id} {width}x{height} BGRA "
-          f"stride={iosurface.IOSurfaceGetBytesPerRow(surface)}", flush=True)
+    shared = SharedSurface(render_window, width, height)
 
-    camera = render_window.GetRenderers().GetFirstRenderer().GetActiveCamera()
+    def render():
+        render_window.Render()
+        # IOSurfaces have no implicit fences, so finish before telling Electron.
+        render_window.MakeCurrent()
+        cgl.glFinish()
+
+    def resize(width, height):
+        nonlocal shared
+        old, shared = shared, SharedSurface(render_window, width, height)
+        old.release()
+        return shared.message()
+
     conn = LineSocket(port)
     try:
-        conn.send({
-            "type": "texture",
-            "pid": os.getpid(),
-            "width": width,
-            "height": height,
-            "pixelFormat": "bgra",
-            "ioSurfaceId": surface_id,
-        })
-        seq = 0
-        frame_interval = 1 / 60
-        while True:
-            start = time.monotonic()
-            camera.Azimuth(1.0)
-            render_window.Render()
-            # IOSurfaces have no implicit fences, so finish before telling Electron.
-            render_window.MakeCurrent()
-            cgl.glFinish()
-            conn.send({"type": "frame", "seq": seq, "timestamp_us": int(time.time() * 1e6)})
-            # Backpressure: don't touch the texture until Electron is done reading it.
-            deadline = start + 1.0
-            while True:
-                msg = conn.recv(max(0.0, deadline - time.monotonic()))
-                if msg is None:
-                    print(f"[producer] frame {seq}: no frame_done within 1s, continuing", flush=True)
-                    break
-                if msg.get("type") == "frame_done" and msg.get("seq") == seq:
-                    break
-            seq += 1
-            remaining = frame_interval - (time.monotonic() - start)
-            if remaining > 0:
-                time.sleep(remaining)
+        conn.send(shared.message())
+        serve(conn, render_window, render, resize)
     except (EOFError, ConnectionError):
         print("[producer] connection closed, exiting", flush=True)
     finally:
         conn.sock.close()
         render_window.MakeCurrent()
         render_window.ReleaseGraphicsResources(render_window)
-        cgl.glDeleteTextures(1, ctypes.byref(handle))
+        shared.release()
         render_window.Finalize()
-        cf.CFRelease(surface)
 
 
 if __name__ == "__main__":

@@ -5,21 +5,17 @@ Usage: wayland_vtk_frame_producer.py <port> <width> <height>
 The vtkOpenGLRenderWindow resolves its RenderFramebuffer into the DisplayFramebuffer
 in Frame(). We swap the DisplayFramebuffer's color attachment for an RGBA8 texture
 exported with eglExportDMABUFImageMESA, and use offscreen buffers so Frame() stops there.
+The texture is reallocated and exported again when the window is resized.
 
-Talks newline-delimited JSON to the Electron main process on 127.0.0.1:<port>:
-  -> {"type":"texture", ...}   once, after the texture is exported
-  -> {"type":"frame", ...}     after every render (glFinish'd)
-  <- {"type":"frame_done", ...} when Electron released the texture
+See producer_common.py for the protocol with the Electron main process and input handling;
+the "texture" message carries the dma-buf's planes, as fds in this process.
 """
 
 import ctypes
 import glob
-import json
 import os
 import signal
-import socket
 import sys
-import time
 
 from vtkmodules.vtkCommonCore import VTK_UNSIGNED_CHAR
 from vtkmodules.vtkCommonDataModel import vtkPiecewiseFunction
@@ -28,6 +24,8 @@ from vtkmodules.vtkRenderingOpenGL2 import vtkEGLRenderWindow, vtkTextureObject
 from vtkmodules.vtkRenderingVolumeOpenGL2 import vtkSmartVolumeMapper
 from vtkmodules.vtkFiltersSources import vtkPartitionedDataSetCollectionSource
 from vtkmodules.vtkImagingCore import vtkRTAnalyticSource
+
+from producer_common import LineSocket, serve
 
 # --- EGL -----------------------------------------------------------------------
 # VTK owns the EGL display and context; this only picks the device and exports
@@ -209,27 +207,37 @@ def export_dmabuf(render_window, tex, height):
     return fourcc_str(fourcc.value), modifiers[0], planes
 
 
-class LineSocket:
-    def __init__(self, port):
-        self.sock = socket.create_connection(("127.0.0.1", port))
-        self.buf = b""
+class ExportedTexture:
+    """The texture VTK resolves into, exported as a dma-buf, at one size."""
 
-    def send(self, msg):
-        self.sock.sendall((json.dumps(msg) + "\n").encode())
+    def __init__(self, render_window, width, height):
+        self.render_window = render_window
+        self.width, self.height = width, height
+        render_window.MakeCurrent()
+        self.tex = attach_texture(render_window, width, height)
+        self.fourcc, self.modifier, self.planes = export_dmabuf(render_window, self.tex, height)
+        print(f"[producer] exported {width}x{height} fourcc={self.fourcc} modifier=0x{self.modifier:016x} "
+              f"planes={self.planes}", flush=True)
+        if self.fourcc not in PIXEL_FORMATS:
+            sys.exit(f"[producer] unsupported fourcc {self.fourcc}")
 
-    def recv(self, timeout):
-        """Return the next message, None on timeout. Raises EOFError on close."""
-        self.sock.settimeout(timeout)
-        while b"\n" not in self.buf:
-            try:
-                chunk = self.sock.recv(4096)
-            except socket.timeout:
-                return None
-            if not chunk:
-                raise EOFError
-            self.buf += chunk
-        line, self.buf = self.buf.split(b"\n", 1)
-        return json.loads(line)
+    def message(self):
+        return {
+            "type": "texture",
+            "pid": os.getpid(),
+            "width": self.width,
+            "height": self.height,
+            "fourcc": self.fourcc,
+            "pixelFormat": PIXEL_FORMATS[self.fourcc],
+            "modifier": str(self.modifier),
+            "planes": self.planes,
+        }
+
+    def release(self):
+        for p in self.planes:
+            os.close(p["fd"])
+        self.render_window.MakeCurrent()
+        self.tex.ReleaseGraphicsResources(self.render_window)
 
 
 def main():
@@ -259,53 +267,28 @@ def main():
     caps = dict(line.split(":", 1) for line in render_window.ReportCapabilities().splitlines() if ":" in line)
     print(f"[producer] GL {caps['OpenGL version string'].strip()} / {caps['OpenGL renderer string'].strip()}", flush=True)
 
-    tex = attach_texture(render_window, width, height)
-    fourcc, modifier, planes = export_dmabuf(render_window, tex, height)
-    print(f"[producer] exported {width}x{height} fourcc={fourcc} modifier=0x{modifier:016x} planes={planes}", flush=True)
-    if fourcc not in PIXEL_FORMATS:
-        sys.exit(f"[producer] unsupported fourcc {fourcc}")
+    shared = ExportedTexture(render_window, width, height)
 
-    camera = render_window.GetRenderers().GetFirstRenderer().GetActiveCamera()
+    def render():
+        render_window.Render()
+        # glFinish, so the frame is complete before Electron samples the dma-buf.
+        render_window.WaitForCompletion()
+
+    def resize(width, height):
+        nonlocal shared
+        old, shared = shared, ExportedTexture(render_window, width, height)
+        old.release()
+        return shared.message()
+
     conn = LineSocket(port)
     try:
-        conn.send({
-            "type": "texture",
-            "pid": os.getpid(),
-            "width": width,
-            "height": height,
-            "fourcc": fourcc,
-            "pixelFormat": PIXEL_FORMATS[fourcc],
-            "modifier": str(modifier),
-            "planes": planes,
-        })
-        seq = 0
-        frame_interval = 1 / 60
-        while True:
-            start = time.monotonic()
-            camera.Azimuth(1.0)
-            render_window.Render()
-            # glFinish, so the frame is complete before Electron samples the dma-buf.
-            render_window.WaitForCompletion()
-            conn.send({"type": "frame", "seq": seq, "timestamp_us": int(time.time() * 1e6)})
-            # Backpressure: don't touch the texture until Electron is done reading it.
-            deadline = start + 1.0
-            while True:
-                msg = conn.recv(max(0.0, deadline - time.monotonic()))
-                if msg is None:
-                    print(f"[producer] frame {seq}: no frame_done within 1s, continuing", flush=True)
-                    break
-                if msg.get("type") == "frame_done" and msg.get("seq") == seq:
-                    break
-            seq += 1
-            remaining = frame_interval - (time.monotonic() - start)
-            if remaining > 0:
-                time.sleep(remaining)
+        conn.send(shared.message())
+        serve(conn, render_window, render, resize)
     except (EOFError, ConnectionError):
         print("[producer] connection closed, exiting", flush=True)
     finally:
         conn.sock.close()
-        for p in planes:
-            os.close(p["fd"])
+        shared.release()
         render_window.MakeCurrent()
         render_window.ReleaseGraphicsResources(render_window)
         render_window.Finalize()

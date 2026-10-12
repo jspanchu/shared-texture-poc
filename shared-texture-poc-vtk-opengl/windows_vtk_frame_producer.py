@@ -6,24 +6,23 @@ The vtkOpenGLRenderWindow resolves its RenderFramebuffer into the DisplayFramebu
 in Frame(). We swap the DisplayFramebuffer's color attachment for a GL texture that
 aliases a D3D11 texture through WGL_NV_DX_interop2, and use offscreen buffers so
 Frame() stops there. Each frame is then copied into a texture shared by NT handle.
+Both textures are reallocated when the window is resized.
 
-Talks newline-delimited JSON to the Electron main process on 127.0.0.1:<port>:
-  -> {"type":"texture", ...}   once, with the texture's NT handle in this process
-  -> {"type":"frame", ...}     after every render (finished on the GPU)
-  <- {"type":"frame_done", ...} when Electron released the texture
+See producer_common.py for the protocol with the Electron main process and input handling;
+the "texture" message carries the shared texture's NT handle in this process.
 
 Environment:
   D3D_ADAPTER=<index>  DXGI adapter to allocate on (default 0, the one Chromium uses)
 """
 
 import ctypes
-import json
 import os
 import signal
-import socket
 import sys
 import time
 from ctypes import wintypes
+
+from producer_common import LineSocket, serve
 
 from vtkmodules.vtkCommonDataModel import vtkPiecewiseFunction
 from vtkmodules.vtkRenderingCore import vtkCompositePolyDataMapper, vtkVolume, vtkActor, vtkRenderer, vtkRenderWindow, vtkColorTransferFunction, vtkVolumeProperty
@@ -263,27 +262,37 @@ def attach_texture(render_window, interop, gl_device, d3d_texture, width, height
     return tex, handle, objs
 
 
-class LineSocket:
-    def __init__(self, port):
-        self.sock = socket.create_connection(("127.0.0.1", port))
-        self.buf = b""
+class SharedTexture:
+    """VTK's D3D11 render target and the texture shared with Electron, at one size."""
 
-    def send(self, msg):
-        self.sock.sendall((json.dumps(msg) + "\n").encode())
+    def __init__(self, render_window, device, interop, gl_device, width, height):
+        self.render_window, self.interop, self.gl_device = render_window, interop, gl_device
+        self.width, self.height = width, height
+        # NVIDIA's interop can't register textures created with SHARED_NTHANDLE (ERROR_OPEN_FAILED),
+        # so VTK renders into a private texture that gets copied into the shared one on the GPU.
+        self.render_texture = create_texture(device, width, height)
+        self.texture, self.nt_handle = create_shared_texture(device, width, height)
+        self.tex, self.handle, self.objs = attach_texture(
+            render_window, interop, gl_device, self.render_texture, width, height)
+        print(f"[producer] D3D11 texture {width}x{height} BGRA NT handle=0x{self.nt_handle:x}", flush=True)
 
-    def recv(self, timeout):
-        """Return the next message, None on timeout. Raises EOFError on close."""
-        self.sock.settimeout(timeout)
-        while b"\n" not in self.buf:
-            try:
-                chunk = self.sock.recv(4096)
-            except socket.timeout:
-                return None
-            if not chunk:
-                raise EOFError
-            self.buf += chunk
-        line, self.buf = self.buf.split(b"\n", 1)
-        return json.loads(line)
+    def message(self):
+        return {
+            "type": "texture",
+            "pid": os.getpid(),
+            "width": self.width,
+            "height": self.height,
+            "pixelFormat": "bgra",
+            "ntHandle": self.nt_handle,
+        }
+
+    def release(self):
+        self.render_window.MakeCurrent()
+        self.interop.unregister(self.gl_device, self.objs[0])
+        opengl32.glDeleteTextures(1, ctypes.byref(self.handle))
+        kernel32.CloseHandle(self.nt_handle)
+        release(self.texture)
+        release(self.render_texture)
 
 
 def main():
@@ -305,18 +314,13 @@ def main():
     print(f"[producer] GL {caps['OpenGL version string'].strip()} / {caps['OpenGL renderer string'].strip()}", flush=True)
 
     device, d3d_ctx = create_device()
-    # NVIDIA's interop can't register textures created with SHARED_NTHANDLE (ERROR_OPEN_FAILED),
-    # so VTK renders into a private texture that gets copied into the shared one on the GPU.
-    render_texture = create_texture(device, width, height)
-    texture, nt_handle = create_shared_texture(device, width, height)
-
     render_window.MakeCurrent()
     interop = DXInterop()
     gl_device = interop.open_device(device)
     if not gl_device:
         sys.exit(f"[producer] wglDXOpenDeviceNV failed: {ctypes.GetLastError()} "
                  "(GL and D3D11 on different GPUs? try D3D_ADAPTER)")
-    tex, handle, objs = attach_texture(render_window, interop, gl_device, render_texture, width, height)
+    shared = SharedTexture(render_window, device, interop, gl_device, width, height)
 
     # An event query tells us when the D3D11 device (and so the texture) is idle.
     query_desc = D3D11_QUERY_DESC(Query=D3D11_QUERY_EVENT)
@@ -325,62 +329,38 @@ def main():
              "CreateQuery")
     done = wintypes.BOOL()
 
-    print(f"[producer] D3D11 texture {width}x{height} BGRA NT handle=0x{nt_handle:x}", flush=True)
+    def render():
+        render_window.MakeCurrent()
+        interop.lock(gl_device, 1, shared.objs)
+        render_window.Render()
+        # Unlocking hands the texture back to D3D11, ordered after VTK's GL commands.
+        interop.unlock(gl_device, 1, shared.objs)
+        com_call(d3d_ctx, ID3D11DeviceContext_CopyResource, None, shared.texture, shared.render_texture)
+        # The shared texture has no keyed mutex, so wait until the GPU is done before telling Electron.
+        com_call(d3d_ctx, ID3D11DeviceContext_End, None, query)
+        while com_call(d3d_ctx, ID3D11DeviceContext_GetData, HRESULT, query, ctypes.byref(done),
+                       ctypes.c_uint(ctypes.sizeof(done)), ctypes.c_uint(0)) != 0:
+            time.sleep(0)
 
-    camera = render_window.GetRenderers().GetFirstRenderer().GetActiveCamera()
+    def resize(width, height):
+        nonlocal shared
+        old, shared = shared, SharedTexture(render_window, device, interop, gl_device, width, height)
+        old.release()
+        return shared.message()
+
     conn = LineSocket(port)
     try:
-        conn.send({
-            "type": "texture",
-            "pid": os.getpid(),
-            "width": width,
-            "height": height,
-            "pixelFormat": "bgra",
-            "ntHandle": nt_handle,
-        })
-        seq = 0
-        frame_interval = 1 / 60
-        while True:
-            start = time.monotonic()
-            camera.Azimuth(1.0)
-            render_window.MakeCurrent()
-            interop.lock(gl_device, 1, objs)
-            render_window.Render()
-            # Unlocking hands the texture back to D3D11, ordered after VTK's GL commands.
-            interop.unlock(gl_device, 1, objs)
-            com_call(d3d_ctx, ID3D11DeviceContext_CopyResource, None, texture, render_texture)
-            # The shared texture has no keyed mutex, so wait until the GPU is done before telling Electron.
-            com_call(d3d_ctx, ID3D11DeviceContext_End, None, query)
-            while com_call(d3d_ctx, ID3D11DeviceContext_GetData, HRESULT, query, ctypes.byref(done),
-                           ctypes.c_uint(ctypes.sizeof(done)), ctypes.c_uint(0)) != 0:
-                time.sleep(0)
-            conn.send({"type": "frame", "seq": seq, "timestamp_us": int(time.time() * 1e6)})
-            # Backpressure: don't touch the texture until Electron is done reading it.
-            deadline = start + 1.0
-            while True:
-                msg = conn.recv(max(0.0, deadline - time.monotonic()))
-                if msg is None:
-                    print(f"[producer] frame {seq}: no frame_done within 1s, continuing", flush=True)
-                    break
-                if msg.get("type") == "frame_done" and msg.get("seq") == seq:
-                    break
-            seq += 1
-            remaining = frame_interval - (time.monotonic() - start)
-            if remaining > 0:
-                time.sleep(remaining)
+        conn.send(shared.message())
+        serve(conn, render_window, render, resize)
     except (EOFError, ConnectionError):
         print("[producer] connection closed, exiting", flush=True)
     finally:
         conn.sock.close()
         render_window.MakeCurrent()
         render_window.ReleaseGraphicsResources(render_window)
-        interop.unregister(gl_device, objs[0])
-        opengl32.glDeleteTextures(1, ctypes.byref(handle))
+        shared.release()
         interop.close_device(gl_device)
         release(query)
-        kernel32.CloseHandle(nt_handle)
-        release(texture)
-        release(render_texture)
         release(d3d_ctx)
         release(device)
         render_window.Finalize()
