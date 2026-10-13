@@ -211,8 +211,6 @@ def main():
     # Render into the FBOs only: Frame() then stops after resolving into the DisplayFramebuffer.
     render_window.SetUseOffScreenBuffers(True)
     render_window.SetShowWindow(False)
-    # GL's first row is the bottom, an IOSurface's is the top.
-    render_window.SetFramebufferFlipY(True)
     # The first render creates the context and the framebuffers we're about to patch.
     render_window.Render()
     render_window.MakeCurrent()

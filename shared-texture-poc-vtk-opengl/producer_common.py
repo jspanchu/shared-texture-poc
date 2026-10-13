@@ -15,6 +15,7 @@ import json
 import socket
 import time
 
+from vtkmodules.vtkCommonCore import vtkUnsignedCharArray
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 from vtkmodules.vtkRenderingUI import vtkGenericRenderWindowInteractor
 
@@ -102,12 +103,20 @@ def dispatch(interactor, event):
         interactor.InvokeEvent("CharEvent")
 
 
-def serve(conn, render_window, render, resize):
+def center_pixel(render_window):
+    width, height = render_window.GetSize()
+    data = vtkUnsignedCharArray()
+    render_window.GetRGBACharPixelData(width // 2, height // 2, width // 2, height // 2, 1, data)
+    return [int(data.GetValue(i)) for i in range(4)]
+
+
+def serve(conn, render_window, render, resize, read_center_pixel=center_pixel):
     """Render on demand and replay the canvas's input on the scene until Electron disconnects.
 
     render() renders a frame into the shared texture and returns once the GPU finished it.
     resize(width, height) reallocates the shared texture after the window was resized,
     and returns its "texture" message.
+    read_center_pixel(render_window) used to log center pixel on first draw
     """
     interactor = vtkGenericRenderWindowInteractor(render_window=render_window,
                                                   interactor_style=vtkInteractorStyleTrackballCamera())
@@ -117,6 +126,7 @@ def serve(conn, render_window, render, resize):
     interactor.Initialize()
     dirty = True
     pending_size = None
+    log_pixel = True
 
     def request_render(*_):
         nonlocal dirty
@@ -142,11 +152,16 @@ def serve(conn, render_window, render, resize):
                 interactor.UpdateSize(*pending_size)
                 conn.send(resize(*pending_size))
                 dirty = True
+                log_pixel = True
             pending_size = None
         if not dirty:
             continue
         dirty = False
         render()
+        if log_pixel:
+            log_pixel = False
+            print(f"[producer] first frame into the shared texture: center rgba={read_center_pixel(render_window)}",
+                  flush=True)
         conn.send({"type": "frame", "seq": seq, "timestamp_us": int(time.time() * 1e6)})
         # Backpressure: don't touch the texture until Electron is done reading it. Input keeps
         # moving the camera meanwhile; a resize waits, since it frees the texture.

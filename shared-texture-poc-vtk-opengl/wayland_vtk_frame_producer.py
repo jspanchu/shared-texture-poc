@@ -260,8 +260,6 @@ def main():
     # Render into the FBOs only: Frame() then stops after resolving into the DisplayFramebuffer.
     render_window.SetUseOffScreenBuffers(True)
     render_window.SetShowWindow(False)
-    # GL's first row is the bottom, a dma-buf's is the top.
-    render_window.SetFramebufferFlipY(True)
     # The first render creates the context and the framebuffers we're about to patch.
     render_window.Render()
     caps = dict(line.split(":", 1) for line in render_window.ReportCapabilities().splitlines() if ":" in line)

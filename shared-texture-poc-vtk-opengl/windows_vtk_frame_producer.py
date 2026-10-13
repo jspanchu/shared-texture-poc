@@ -22,7 +22,7 @@ import sys
 import time
 from ctypes import wintypes
 
-from producer_common import LineSocket, serve
+from producer_common import LineSocket, center_pixel, serve
 
 from vtkmodules.vtkCommonDataModel import vtkPiecewiseFunction
 from vtkmodules.vtkRenderingCore import vtkCompositePolyDataMapper, vtkVolume, vtkActor, vtkRenderer, vtkRenderWindow, vtkColorTransferFunction, vtkVolumeProperty
@@ -306,8 +306,6 @@ def main():
     # Render into the FBOs only: Frame() then stops after resolving into the DisplayFramebuffer.
     render_window.SetUseOffScreenBuffers(True)
     render_window.SetShowWindow(False)
-    # GL's first row is the bottom, a D3D11 texture's is the top.
-    render_window.SetFramebufferFlipY(True)
     # The first render creates the context and the framebuffers we're about to patch.
     render_window.Render()
     caps = dict(line.split(":", 1) for line in render_window.ReportCapabilities().splitlines() if ":" in line)
@@ -342,6 +340,15 @@ def main():
                        ctypes.c_uint(ctypes.sizeof(done)), ctypes.c_uint(0)) != 0:
             time.sleep(0)
 
+    def read_center_pixel(render_window):
+        # The D3D11 texture is only readable from GL while locked.
+        render_window.MakeCurrent()
+        interop.lock(gl_device, 1, shared.objs)
+        try:
+            return center_pixel(render_window)
+        finally:
+            interop.unlock(gl_device, 1, shared.objs)
+
     def resize(width, height):
         nonlocal shared
         old, shared = shared, SharedTexture(render_window, device, interop, gl_device, width, height)
@@ -351,7 +358,7 @@ def main():
     conn = LineSocket(port)
     try:
         conn.send(shared.message())
-        serve(conn, render_window, render, resize)
+        serve(conn, render_window, render, resize, read_center_pixel)
     except (EOFError, ConnectionError):
         print("[producer] connection closed, exiting", flush=True)
     finally:

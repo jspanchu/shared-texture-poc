@@ -20,7 +20,11 @@ window.addEventListener('DOMContentLoaded', () => {
       canvas.width = vf.displayWidth;
       canvas.height = vf.displayHeight;
     }
+    // The producers render with GL, whose first row is the bottom, into textures whose first
+    // row is the top: draw the frame upside down to undo that.
+    ctx.setTransform(1, 0, 0, -1, 0, canvas.height);
     ctx.drawImage(vf, 0, 0, canvas.width, canvas.height);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     const info = `${vf.codedWidth}x${vf.codedHeight} ${vf.format}`;
     vf.close();
     importedSharedTexture.release();
