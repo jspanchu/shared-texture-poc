@@ -1,0 +1,62 @@
+const { contextBridge, ipcRenderer, sharedTexture } = require('electron');
+
+const STATS_INTERVAL_MS = 1000;
+
+// The canvas of the page's shared-texture-view, attached when the component mounts.
+let canvas = null;
+let ctx = null;
+let onStats = null;
+
+let frames = 0;
+let windowStart = performance.now();
+let windowFrames = 0;
+let info = '';
+
+sharedTexture.setSharedTextureReceiver(async ({ importedSharedTexture }) => {
+  if (!canvas) {
+    importedSharedTexture.release();
+    return;
+  }
+  const vf = importedSharedTexture.getVideoFrame();
+  // The canvas's pixels follow the producer's texture, which follows the canvas's size.
+  if (canvas.width !== vf.displayWidth || canvas.height !== vf.displayHeight) {
+    canvas.width = vf.displayWidth;
+    canvas.height = vf.displayHeight;
+  }
+  ctx.drawImage(vf, 0, 0, canvas.width, canvas.height);
+  info = `${vf.codedWidth}x${vf.codedHeight} ${vf.format}`;
+  vf.close();
+  importedSharedTexture.release();
+  frames++;
+  windowFrames++;
+});
+
+// Frames are rendered on demand, so report on a timer: an idle view is at 0 fps, not at its last rate.
+setInterval(() => {
+  const now = performance.now();
+  const fps = (windowFrames * 1000) / (now - windowStart);
+  const hadFrames = windowFrames > 0;
+  windowStart = now;
+  windowFrames = 0;
+  onStats?.({ fps: Number(fps.toFixed(1)), frames, info });
+  if (hadFrames && ctx) {
+    const center = [...ctx.getImageData(canvas.width >> 1, canvas.height >> 1, 1, 1).data];
+    ipcRenderer.send('stats', { frames, fps: fps.toFixed(1), info, center });
+  }
+}, STATS_INTERVAL_MS);
+
+// The page's world can't touch sharedTexture or VideoFrames from here, but it can hand us its
+// canvas, and a callback for the frame rate.
+contextBridge.exposeInMainWorld('ElectronSharedTextureView', {
+  attach: (el, statsCallback) => {
+    canvas = el;
+    ctx = el.getContext('2d');
+    onStats = statsCallback ?? null;
+  },
+  detach: (el) => {
+    if (canvas !== el) return;
+    canvas = null;
+    ctx = null;
+    onStats = null;
+  },
+});

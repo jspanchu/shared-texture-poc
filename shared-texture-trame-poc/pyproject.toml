@@ -1,0 +1,16 @@
+[project]
+name = "trame-electron-poc"
+version = "0.0.1"
+description = "Trame with electron using shared texture"
+authors = [
+    {name = "Kitware, Inc."}
+]
+dependencies = [
+    "vtk>=9.7.1",
+    "trame-client>=4.1.4",
+    "trame>=4.0.0",
+    "trame-rca>=2.11.8",
+    "trame-vuetify>=3.3.0",
+]
+requires-python = ">=3.12"
+license = {text = "Apache License 2.0"}
