@@ -117,9 +117,12 @@ class ElectronApp(TrameApp):
     def before_render(self):
         # Spin by a degree per frame: each frame asks for the next one.
         if self.state.spinning:
+            self.render_window.interactor.SetStillUpdateRate(60)
             self.renderer.GetActiveCamera().Azimuth(1.0)
             self.renderer.ResetCameraClippingRange()
             self.scheduler.schedule_render()
+        else:
+            self.render_window.interactor.SetStillUpdateRate(0.0001)
 
     @change("spinning")
     def on_spinning_change(self, spinning, **_):
