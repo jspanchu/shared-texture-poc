@@ -192,7 +192,7 @@ class ElectronApp(TrameApp):
 
             with self.ui.content:
                 with v3.VContainer(fluid=True, classes="pa-0 fill-height position-relative"):
-                    with rca.RemoteControlledArea(display="shared-texture") as view:
+                    with rca.RemoteControlledArea(display="shared-texture", event_throttle_ms=10) as view:
                         ElectronSharedTextureView(stats="stats = $event")
                     self.view_handler = RcaViewAdapter(self.scheduler.rca, view.name, scheduler=self.scheduler)
                     view.add_view_handler(self.view_handler)
