@@ -218,7 +218,7 @@ const createWindow = () => {
 
   ipcMain.on("stats", (_event, s) =>
     console.log(
-      `[renderer] frames=${s.frames} fps=${s.fps} ${s.info} center rgba=${s.center}`,
+      `[renderer] frames=${s.frames} fps=${s.fps} ${s.info}`,
     ),
   );
   startProducer(win);

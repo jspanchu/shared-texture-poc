@@ -36,8 +36,7 @@ window.addEventListener('DOMContentLoaded', () => {
       fps = (windowFrames * 1000) / (now - windowStart);
       windowStart = now;
       windowFrames = 0;
-      const center = [...ctx.getImageData(canvas.width >> 1, canvas.height >> 1, 1, 1).data];
-      ipcRenderer.send('stats', { frames, fps: fps.toFixed(1), info, center });
+      ipcRenderer.send('stats', { frames, fps: fps.toFixed(1), info });
     }
     stats.textContent = `frame ${frames} | ${fps.toFixed(1)} fps | ${info}`;
   });

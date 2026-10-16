@@ -44,8 +44,7 @@ setInterval(() => {
   windowFrames = 0;
   onStats?.({ fps: Number(fps.toFixed(1)), frames, info });
   if (hadFrames && ctx) {
-    const center = [...ctx.getImageData(canvas.width >> 1, canvas.height >> 1, 1, 1).data];
-    ipcRenderer.send('stats', { frames, fps: fps.toFixed(1), info, center });
+    ipcRenderer.send('stats', { frames, fps: fps.toFixed(1), info });
   }
 }, STATS_INTERVAL_MS);
 
