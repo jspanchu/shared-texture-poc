@@ -120,6 +120,7 @@ def serve(conn, render_window, render, resize, read_center_pixel=center_pixel):
     """
     interactor = vtkGenericRenderWindowInteractor(render_window=render_window,
                                                   interactor_style=vtkInteractorStyleTrackballCamera())
+    interactor.SetStillUpdateRate(60)
     # The style asks for renders through the interactor. render() stays the only place that
     # renders: the shared texture may need to be locked around it.
     interactor.EnableRenderOff()
@@ -156,7 +157,8 @@ def serve(conn, render_window, render, resize, read_center_pixel=center_pixel):
             pending_size = None
         if not dirty:
             continue
-        dirty = False
+        render_window.renderers.GetFirstRenderer().GetActiveCamera().Azimuth(1.0)
+        dirty = True
         render()
         if log_pixel:
             log_pixel = False
