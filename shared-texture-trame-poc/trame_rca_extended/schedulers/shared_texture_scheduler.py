@@ -17,7 +17,7 @@ import traceback
 from trame.app import asynchronous
 from trame_rca.rca import VtkRemoteControlledArea
 
-from trame_rca_extended.texture_passports.iosurface_texture_passport import IOSurfaceTexturePassport
+from trame_rca_extended.texture_passports.iosurface import IOSurfaceTexturePassport
 from trame_rca_extended.texture_passports.texture_comm import LineConnection
 
 FRAME_DONE_TIMEOUT_S = 1.0
