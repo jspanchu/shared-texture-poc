@@ -5,7 +5,7 @@ class AbstractTexturePassport:
         self.height = height
 
     def to_json(self):
-        pass
+        return {}
 
     def release(self):
         pass

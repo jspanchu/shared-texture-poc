@@ -3,12 +3,9 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
-const {
-  lookupSurface,
-  describeSurface,
-  surfaceHandle,
-  releaseSurface,
-} = require("./dma/iosurface");
+const { platform } = require("node:process");
+
+const iosurface = () => require("./dma/iosurface");
 
 // The trame app lives one level up, with its venv.
 const APP_DIR = path.join(__dirname, "..");
@@ -17,28 +14,55 @@ let producer = null;
 let server = null;
 let socket = null;
 let surfaceRef = null;
+let localHandle = null;
+
 
 const pythonPath = () => {
   const venv = path.join(APP_DIR, ".venv", "bin", "python");
   return fs.existsSync(venv) ? venv : process.env.PYTHON || "python3";
 };
 
+// On Linux, Electron uses Wayland when it's available, unless --ozone-platform=x11.
+const texturePassportName = () => {
+  if (process.platform === "darwin") return "iosurface";
+  if (process.platform === "win32") return "nthandle";
+  // --ozone-platform wins over --ozone-platform-hint, whose default is auto.
+  const ozone =
+    app.commandLine.getSwitchValue("ozone-platform") ||
+    app.commandLine.getSwitchValue("ozone-platform-hint") ||
+    "auto";
+  const wayland =
+    ozone === "auto" ? !!process.env.WAYLAND_DISPLAY : ozone === "wayland";
+  return wayland ? "wayland-dmabuf" : "x11-dmabuf";
+};
+
 const send = (msg) => {
   if (socket && !socket.destroyed) socket.write(JSON.stringify(msg) + "\n");
+};
+
+// Open the producer's global IOSurface in this process.
+const ioSurfaceHandle = (msg) => {
+  const { lookupSurface, describeSurface, surfaceHandle } = iosurface();
+  surfaceRef = lookupSurface(msg.ioSurfaceId);
+  console.log(
+    `[main] texture ${msg.width}x${msg.height} (${msg.pixelFormat}) IOSurface id=${msg.ioSurfaceId} ${describeSurface(surfaceRef)}`,
+  );
+  return { ioSurface: surfaceHandle(surfaceRef) };
+};
+
+const textureHandle = (msg) => {
+  if (msg.ioSurfaceId !== undefined) return ioSurfaceHandle(msg);
+  throw new Error("unsupported texture handle");
 };
 
 // Open the producer's global IOSurface in this process, and describe it for
 // sharedTexture.importSharedTexture.
 const importTextureInfo = (msg) => {
-  surfaceRef = lookupSurface(msg.ioSurfaceId);
-  console.log(
-    `[main] texture ${msg.width}x${msg.height} (${msg.pixelFormat}) IOSurface id=${msg.ioSurfaceId} ${describeSurface(surfaceRef)}`,
-  );
   return {
     pixelFormat: msg.pixelFormat,
     codedSize: { width: msg.width, height: msg.height },
     visibleRect: { x: 0, y: 0, width: msg.width, height: msg.height },
-    handle: { ioSurface: surfaceHandle(surfaceRef) },
+    handle: textureHandle(msg),
   };
 };
 
@@ -69,6 +93,7 @@ const handleConnection = (win, conn) => {
   conn.setNoDelay(true);
   let textureInfo = null;
   let buf = "";
+  send({ type: "texture_passport_meta", name: texturePassportName() });
   conn.on("data", (chunk) => {
     buf += chunk.toString();
     let nl;
@@ -136,8 +161,10 @@ const startProducer = (win) => {
 
 // Close this process's reference to the producer's texture.
 const releaseTexture = () => {
-  if (surfaceRef) releaseSurface(surfaceRef);
+  if (surfaceRef) iosurface().releaseSurface(surfaceRef);
   surfaceRef = null;
+  if (localHandle) winhandle().closeHandle(localHandle);
+  localHandle = null;
 };
 
 const cleanup = () => {

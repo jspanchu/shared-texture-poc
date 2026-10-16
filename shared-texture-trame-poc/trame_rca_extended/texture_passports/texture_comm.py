@@ -4,9 +4,10 @@ Talks newline-delimited JSON to the Electron main process on 127.0.0.1:<port>.
 -> means python to EMP
 <- means EMP to Python
 
-    -> {"type":"texture", ...}    at start and after every resize, describing the shared texture
-    -> {"type":"frame", ...}      after every render (finished on the GPU)
-    <- {"type":"frame_done", ...} when Electron released the texture
+    <- {"type":"texture_passport_meta", ...}    at start, name of the texture passport class.
+    -> {"type":"texture", ...}                  at start and after every resize, describing the shared texture
+    -> {"type":"frame", ...}                    after every render (finished on the GPU)
+    <- {"type":"frame_done", ...}               when Electron released the texture
 
 Everything else (size, input, app state) goes from the renderer process to trame over its websocket.
 """

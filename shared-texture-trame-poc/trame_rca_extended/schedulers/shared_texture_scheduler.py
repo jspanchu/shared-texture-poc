@@ -17,7 +17,7 @@ import traceback
 from trame.app import asynchronous
 from trame_rca.rca import VtkRemoteControlledArea
 
-from trame_rca_extended.texture_passports.iosurface import IOSurfaceTexturePassport
+from trame_rca_extended.texture_passports import factory
 from trame_rca_extended.texture_passports.texture_comm import LineConnection
 
 FRAME_DONE_TIMEOUT_S = 1.0
@@ -45,6 +45,7 @@ class ElectronSharedTextureRenderScheduler:
 
         self._conn = None
         self._passport = None
+        self._passport_name_future = None
         self._seq = 0
         self._frame_done = None
         # Renders asked for before start() wait in here.
@@ -103,9 +104,11 @@ class ElectronSharedTextureRenderScheduler:
             self._passport = None
 
     async def _run(self):
+        self._passport_name_future = asyncio.get_running_loop().create_future()
         self._conn = await LineConnection.open(self._emp_port)
         print(f"[producer] connected to EMP on port {self._emp_port}", flush=True)
         self._start_task(self._read())
+        passport_name = await self._passport_name_future
         while not self._is_closing:
             await self._request_event.wait()
             self._request_event.clear()
@@ -114,11 +117,11 @@ class ElectronSharedTextureRenderScheduler:
                 continue
             started = time.monotonic()
 
-            await self._update_texture()
+            await self._update_texture(passport_name)
+            assert self._passport
             if self._before_render:
                 self._before_render()
             self._render_window.Render()
-            # IOSurfaces have no implicit fences, so finish before telling Electron.
             self._render_window.MakeCurrent()
             self._passport.flush_graphics_commands()
 
@@ -136,7 +139,7 @@ class ElectronSharedTextureRenderScheduler:
 
             await asyncio.sleep(max(0.0, 1.0 / self._target_fps - (time.monotonic() - started)))
 
-    async def _update_texture(self):
+    async def _update_texture(self, passport_name):
         """(Re)allocate the shared texture when the render window's size changed."""
         width, height = self._render_window.GetSize()
         if self._passport and (self._passport.width, self._passport.height) == (width, height):
@@ -145,7 +148,8 @@ class ElectronSharedTextureRenderScheduler:
             # The first render creates the context and the framebuffers the passport patches.
             self._render_window.Render()
             self._render_window.MakeCurrent()
-        old, self._passport = self._passport, IOSurfaceTexturePassport(self._render_window, width, height)
+        passport_class = factory.texture_passport_class(passport_name)
+        old, self._passport = self._passport, passport_class(self._render_window, width, height)
         if old:
             # Frames still in flight hold their own imports in Electron.
             old.release()
@@ -158,6 +162,9 @@ class ElectronSharedTextureRenderScheduler:
                 if (msg["type"] == "frame_done" and msg["seq"] == self._seq - 1
                         and self._frame_done and not self._frame_done.done()):
                     self._frame_done.set_result(None)
+                if msg["type"] == "texture_passport_meta":
+                    self._passport_name_future.set_result(msg["name"])
+
         except (EOFError, ConnectionError):
             print("[producer] EMP disconnected", flush=True)
             await self.close()
