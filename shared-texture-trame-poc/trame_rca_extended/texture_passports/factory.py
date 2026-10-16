@@ -5,7 +5,8 @@ def texture_passport_class(name):
         from .iosurface import IOSurfaceTexturePassport
         return IOSurfaceTexturePassport
     elif name == "nthandle":
-        raise NotImplementedError("nthandle passport not supported yet")
+        from .nthandle import NTHandleTexturePassport
+        return NTHandleTexturePassport
     elif name == "wayland-dmabuf":
         from .wayland_dmabuf import WaylandDMABUFTexturePassport
         return WaylandDMABUFTexturePassport

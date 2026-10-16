@@ -36,6 +36,11 @@ if sys.platform == "linux":
     # constructor only reads the device from this variable.
     os.environ["VTK_EGL_DEVICE_INDEX"] = str(wayland_dmabuf.device_index(render_node))
     os.environ["VTK_DEFAULT_OPENGL_WINDOW"] = "vtkEGLRenderWindow"
+elif sys.platform == "win32":
+    from trame_rca_extended.texture_passports import nthandle
+    # The shared texture must live on the GPU Chromium uses, which is DXGI adapter 0
+    # unless told otherwise. VTK's WGL context has to be on that GPU too.
+    nthandle.init_device(int(os.environ.get("D3D_ADAPTER", "0")))
 
 # Required for vtk factory
 import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
@@ -66,7 +71,7 @@ def create_vtk_pipeline():
     renderer = vtkRenderer()
     renderer.AddVolume(volume_actor)
     renderer.AddActor(shapes_actor)
-    # The IOSurface's alpha reaches Electron, so keep the background opaque.
+    # The texture's alpha reaches Electron, so keep the background opaque.
     renderer.SetBackgroundAlpha(1.0)
     renderer.ResetCamera()
 

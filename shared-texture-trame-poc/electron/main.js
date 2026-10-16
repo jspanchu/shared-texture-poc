@@ -5,8 +5,11 @@ const net = require("node:net");
 const path = require("node:path");
 const { platform } = require("node:process");
 
+// Loaded on demand: pidfd.js needs Linux's libc, iosurface.js needs macOS frameworks,
+// winhandle.js needs kernel32.
 const pidfd = () => require("./dma/pidfd");
 const iosurface = () => require("./dma/iosurface");
+const winhandle = () => require("./dma/winhandle");
 
 // The trame app lives one level up, with its venv.
 const APP_DIR = path.join(__dirname, "..");
@@ -20,8 +23,14 @@ let localHandle = null;
 
 
 const pythonPath = () => {
-  const venv = path.join(APP_DIR, ".venv", "bin", "python");
-  return fs.existsSync(venv) ? venv : process.env.PYTHON || "python3";
+  const venv =
+    process.platform === "win32"
+      ? path.join(APP_DIR, ".venv", "Scripts", "python.exe")
+      : path.join(APP_DIR, ".venv", "bin", "python");
+  return fs.existsSync(venv)
+    ? venv
+    : process.env.PYTHON ||
+        (process.platform === "win32" ? "python" : "python3");
 };
 
 // On Linux, Electron uses Wayland when it's available, unless --ozone-platform=x11.
@@ -75,8 +84,19 @@ const ioSurfaceHandle = (msg) => {
   return { ioSurface: surfaceHandle(surfaceRef) };
 };
 
+// Duplicate the producer's NT handle into this process.
+const ntHandle = (msg) => {
+  const { dupHandleFromProcess, handleBuffer } = winhandle();
+  localHandle = dupHandleFromProcess(msg.pid, msg.ntHandle);
+  console.log(
+    `[main] texture ${msg.width}x${msg.height} (${msg.pixelFormat}) producer handle 0x${msg.ntHandle.toString(16)} -> local handle 0x${localHandle.toString(16)}`,
+  );
+  return { ntHandle: handleBuffer(localHandle) };
+};
+
 const textureHandle = (msg) => {
   if (msg.ioSurfaceId !== undefined) return ioSurfaceHandle(msg);
+  if (msg.ntHandle !== undefined) return ntHandle(msg);
   return nativePixmapHandle(msg);
 };
 
