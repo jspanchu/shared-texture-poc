@@ -1,9 +1,9 @@
 import json
+import os
 import platform
+import sys
 from importlib.metadata import version
 
-# Required for vtk factory
-import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleTrackballCamera
 
 from trame.app import TrameApp, asynchronous
@@ -24,6 +24,21 @@ from vtkmodules.vtkImagingCore import vtkRTAnalyticSource
 from trame_rca_extended.widgets import ElectronSharedTextureView
 from trame_rca_extended.schedulers import ElectronSharedTextureRenderScheduler
 
+if sys.platform == "linux":
+    from trame_rca_extended.texture_passports import wayland_dmabuf
+    if os.environ.get("RENDER_NODE"):
+        render_node, reason = os.environ["RENDER_NODE"], "env"
+    else:
+        render_node, reason = wayland_dmabuf.default_render_node()
+    print(f"[producer] using render node {render_node} ({reason})", flush=True)
+    
+    # vtkEGLRenderWindow::SetDeviceIndex doesn't reach the EGL display setup; the
+    # constructor only reads the device from this variable.
+    os.environ["VTK_EGL_DEVICE_INDEX"] = str(wayland_dmabuf.device_index(render_node))
+    os.environ["VTK_DEFAULT_OPENGL_WINDOW"] = "vtkEGLRenderWindow"
+
+# Required for vtk factory
+import vtkmodules.vtkRenderingOpenGL2  # noqa: F401
 
 def create_vtk_pipeline():
     wavelet = vtkRTAnalyticSource()
@@ -65,7 +80,6 @@ def create_vtk_pipeline():
 
 PYTHON_PACKAGES = ["vtk", "trame", "trame-client", "trame-server", "trame-vuetify", "trame-rca", "wslink"]
 ELECTRON_VERSIONS = [("Electron", "electron"), ("Chromium", "chrome"), ("Node", "node"), ("V8", "v8")]
-
 
 class ElectronApp(TrameApp):
     def __init__(self, server=None):

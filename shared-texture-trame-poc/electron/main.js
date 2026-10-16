@@ -5,6 +5,7 @@ const net = require("node:net");
 const path = require("node:path");
 const { platform } = require("node:process");
 
+const pidfd = () => require("./dma/pidfd");
 const iosurface = () => require("./dma/iosurface");
 
 // The trame app lives one level up, with its venv.
@@ -13,6 +14,7 @@ const APP_DIR = path.join(__dirname, "..");
 let producer = null;
 let server = null;
 let socket = null;
+let localFds = [];
 let surfaceRef = null;
 let localHandle = null;
 
@@ -40,6 +42,29 @@ const send = (msg) => {
   if (socket && !socket.destroyed) socket.write(JSON.stringify(msg) + "\n");
 };
 
+// Duplicate the producer's dma-buf fds into this process.
+const nativePixmapHandle = (msg) => {
+  console.log(
+    `[main] texture ${msg.width}x${msg.height} ${msg.fourcc} (${msg.pixelFormat}) modifier=${msg.modifier}`,
+  );
+  localFds = msg.planes.map((p) => pidfd().dupFdFromProcess(msg.pid, p.fd));
+  console.log(
+    `[main] producer fds ${msg.planes.map((p) => p.fd)} -> local fds ${localFds}`,
+  );
+  return {
+    nativePixmap: {
+      planes: msg.planes.map((p, i) => ({
+        fd: localFds[i],
+        stride: p.stride,
+        offset: p.offset,
+        size: p.size,
+      })),
+      modifier: msg.modifier,
+      supportsZeroCopyWebGpuImport: false,
+    },
+  };
+};
+
 // Open the producer's global IOSurface in this process.
 const ioSurfaceHandle = (msg) => {
   const { lookupSurface, describeSurface, surfaceHandle } = iosurface();
@@ -52,7 +77,7 @@ const ioSurfaceHandle = (msg) => {
 
 const textureHandle = (msg) => {
   if (msg.ioSurfaceId !== undefined) return ioSurfaceHandle(msg);
-  throw new Error("unsupported texture handle");
+  return nativePixmapHandle(msg);
 };
 
 // Open the producer's global IOSurface in this process, and describe it for
@@ -161,6 +186,8 @@ const startProducer = (win) => {
 
 // Close this process's reference to the producer's texture.
 const releaseTexture = () => {
+  localFds.forEach((fd) => pidfd().closeFd(fd));
+  localFds = [];
   if (surfaceRef) iosurface().releaseSurface(surfaceRef);
   surfaceRef = null;
   if (localHandle) winhandle().closeHandle(localHandle);

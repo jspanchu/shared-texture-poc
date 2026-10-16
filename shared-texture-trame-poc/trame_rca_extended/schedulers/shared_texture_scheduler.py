@@ -56,8 +56,6 @@ class ElectronSharedTextureRenderScheduler:
         # Render into the FBOs only: Frame() then stops after resolving into the DisplayFramebuffer.
         render_window.SetUseOffScreenBuffers(True)
         render_window.SetShowWindow(False)
-        # GL's first row is the bottom, an IOSurface's is the top.
-        render_window.SetFramebufferFlipY(True)
         render_window.GetInteractor().Initialize()
 
     @property
