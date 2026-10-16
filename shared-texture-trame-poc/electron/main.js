@@ -123,8 +123,19 @@ const handleConnection = (win, conn) => {
     buf += chunk.toString();
     let nl;
     while ((nl = buf.indexOf("\n")) >= 0) {
-      const msg = JSON.parse(buf.slice(0, nl));
+      const line = buf.slice(0, nl);
       buf = buf.slice(nl + 1);
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch (err) {
+        // Log the line instead of taking the main process down with it.
+        console.error(
+          `[main] bad line from producer (${line.length} chars): ${JSON.stringify(line)}`,
+          err,
+        );
+        continue;
+      }
       if (msg.type === "texture") {
         try {
           // A new texture after a resize. Frames still in flight hold their own imports.
